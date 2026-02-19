@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual envs
+.venv/
+venv/
+.hamer/
+
+# Outputs
+demo_out/
+out/
+out_video/
+results_webcam/
+
+# Model/data cache
+_DATA/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

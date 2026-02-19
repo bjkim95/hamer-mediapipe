@@ -1,0 +1,16 @@
+numpy==1.26.4
+opencv-python==4.9.0.80
+mediapipe==0.10.9
+scikit-image
+pyrender
+trimesh
+ml-dtypes
+pytorch-lightning
+smplx==0.1.28
+timm
+einops
+yacs
+gdown
+pandas
+webdataset
+omegaconf
