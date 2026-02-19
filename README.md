@@ -1,6 +1,7 @@
-# HaMeR MediaPipe (Inference-Only)
+# HaMeR + MediaPipe
 
-This repository is a fast, lightweight HaMeR variant focused on MediaPipe-based hand detection and hand mesh inference.
+This repository is a fast, lightweight HaMeR variant using MediaPipe for hand detection and HaMeR for hand mesh inference.
+It is adapted from the original HaMeR project: https://github.com/geopavlakos/hamer
 
 ## 1) Installation
 
