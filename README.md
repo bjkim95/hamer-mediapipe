@@ -104,11 +104,3 @@ python demo_mediapipe.py \
   [--hand_colors] \
   [--mesh_only]
 ```
-
-## 5) Checkpoint and Path Policy
-
-- Checkpoints/configs follow the existing `_DATA` layout.
-- Checkpoint priority (default behavior):
-  1. `./_DATA/hamer_ckpts/checkpoints/new_hamer_weights.ckpt`
-  2. `./_DATA/hamer_ckpts/checkpoints/hamer.ckpt` (fallback)
-- You can always override via `--checkpoint /path/to/your.ckpt`.
