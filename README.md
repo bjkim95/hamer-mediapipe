@@ -1,5 +1,7 @@
 # HaMeR + MediaPipe
 
+[![Demo Preview](assets/demo_preview.gif)](assets/demo.mp4)
+
 This repository is a fast, lightweight HaMeR variant using MediaPipe for hand detection and HaMeR for hand mesh inference.
 It is adapted from the original HaMeR project: https://github.com/geopavlakos/hamer
 

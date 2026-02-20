@@ -48,7 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_folder", type=str, default="out")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--save_video", action="store_true", help="Save output as video")
-    parser.add_argument("--fps", type=int, default=30, help="Output video FPS")
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=0,
+        help="Output video FPS (webcam: 0 means auto-estimate from processing speed)",
+    )
+    parser.add_argument("--show_fps", action="store_true", help="Overlay real-time FPS at top-right")
     parser.add_argument(
         "--hand_colors",
         action="store_true",
@@ -67,6 +73,36 @@ def parse_args() -> argparse.Namespace:
         help="Renderer backend for mesh rendering",
     )
     return parser.parse_args()
+
+
+def draw_fps_overlay(image_bgr: np.ndarray, fps_value: float) -> np.ndarray:
+    if not image_bgr.flags["C_CONTIGUOUS"]:
+        image_bgr = np.ascontiguousarray(image_bgr)
+
+    text = f"FPS: {fps_value:.1f}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.8
+    thickness = 2
+    margin = 12
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x = max(0, image_bgr.shape[1] - text_w - margin)
+    y = margin + text_h
+
+    cv2.rectangle(
+        image_bgr,
+        (x - 8, y - text_h - 8),
+        (x + text_w + 8, y + baseline + 6),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(image_bgr, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
+    return image_bgr
+
+
+def should_quit_from_key(key_code: int) -> bool:
+    key = key_code & 0xFF
+    return key in (27, ord("q"), ord("Q"))
 
 
 def resolve_checkpoint(checkpoint_override: str | None) -> str:
@@ -425,22 +461,62 @@ def main():
 
     cap, frame, is_webcam, is_video, total_frames = setup_input_source(args.input)
     output_stem = get_output_stem(args.input, is_webcam)
+    if args.show:
+        print("[INFO] Press q (or ESC) to stop.")
 
     img_h, img_w = frame.shape[:2]
     render_res = (img_w, img_h)
     renderer = Renderer(model_cfg, faces=model.mano.faces, render_res=render_res)
 
-    output_fps = args.fps
+    default_fps = 30.0
+    output_fps = float(args.fps if args.fps > 0 else default_fps)
     ffmpeg_proc = None
     output_video_path = None
+    webcam_auto_fps = args.save_video and is_webcam and args.fps <= 0
+    webcam_probe_frames = []
+    webcam_probe_start = None
+    webcam_probe_target = 45
+
     if is_video:
         input_fps = cap.get(cv2.CAP_PROP_FPS)
-        output_fps = input_fps if input_fps > 0 else args.fps
-        if args.save_video:
+        output_fps = input_fps if input_fps > 0 else float(args.fps if args.fps > 0 else default_fps)
+    if args.save_video and is_video:
+        if is_video:
             print(f"Input video FPS: {output_fps:.2f}")
-            ffmpeg_proc, output_video_path = start_ffmpeg_writer(args.out_folder, output_stem, output_fps, img_w, img_h)
+        ffmpeg_proc, output_video_path = start_ffmpeg_writer(args.out_folder, output_stem, output_fps, img_w, img_h)
+    elif args.save_video and is_webcam and args.fps > 0:
+        print(f"Webcam output FPS (manual): {output_fps:.2f}")
+        ffmpeg_proc, output_video_path = start_ffmpeg_writer(args.out_folder, output_stem, output_fps, img_w, img_h)
+    elif webcam_auto_fps:
+        print("[INFO] Webcam output FPS: auto (estimating from live processing speed)")
+
+    def write_frame_output(frame_bgr: np.ndarray):
+        nonlocal ffmpeg_proc, output_video_path, output_fps, webcam_probe_start, webcam_probe_frames
+        if ffmpeg_proc is not None:
+            ffmpeg_proc.stdin.write(frame_bgr.tobytes())
+            return
+
+        if webcam_auto_fps:
+            if webcam_probe_start is None:
+                webcam_probe_start = time.time()
+            webcam_probe_frames.append(np.ascontiguousarray(frame_bgr))
+            if len(webcam_probe_frames) >= webcam_probe_target:
+                elapsed = max(time.time() - webcam_probe_start, 1e-6)
+                estimated_fps = (len(webcam_probe_frames) - 1) / elapsed
+                output_fps = float(min(max(estimated_fps, 1.0), 60.0))
+                print(f"[INFO] Webcam output FPS (auto): {output_fps:.2f}")
+                ffmpeg_proc, output_video_path = start_ffmpeg_writer(args.out_folder, output_stem, output_fps, img_w, img_h)
+                for buffered_frame in webcam_probe_frames:
+                    ffmpeg_proc.stdin.write(buffered_frame.tobytes())
+                webcam_probe_frames.clear()
+            return
+
+        out_name = f"{output_stem}.jpg" if not is_webcam else f"frame_{frame_id:06d}.jpg"
+        out_path = os.path.join(args.out_folder, out_name)
+        cv2.imwrite(out_path, frame_bgr)
 
     frame_id = 0
+    prev_frame_time = None
     while True:
         if is_webcam:
             ok, frame = cap.read()
@@ -461,6 +537,12 @@ def main():
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         t0 = time.time()
+        realtime_fps = 0.0
+        if prev_frame_time is not None:
+            frame_dt = t0 - prev_frame_time
+            if frame_dt > 0:
+                realtime_fps = 1.0 / frame_dt
+        prev_frame_time = t0
         results = mp_hands.process(img_rgb)
         bboxes, handed_list = extract_mediapipe_hands(results, frame.shape)
         t1 = time.time()
@@ -469,17 +551,13 @@ def main():
         right_np = np.array(handed_list, dtype=np.float32)
 
         if boxes_np.ndim != 2 or boxes_np.shape[0] == 0:
-            out_img = np.zeros_like(frame) if args.mesh_only else frame
-            if is_video:
-                if ffmpeg_proc is not None:
-                    ffmpeg_proc.stdin.write(out_img.tobytes())
-            else:
-                out_name = f"{output_stem}.jpg" if not is_webcam else f"frame_{frame_id:06d}.jpg"
-                out_path = os.path.join(args.out_folder, out_name)
-                cv2.imwrite(out_path, out_img)
+            out_bgr = np.zeros_like(frame) if args.mesh_only else frame
+            if args.show_fps:
+                out_bgr = draw_fps_overlay(out_bgr, realtime_fps)
+            write_frame_output(out_bgr)
             if args.show:
-                cv2.imshow("HaMeR + MediaPipe", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
+                cv2.imshow("HaMeR + MediaPipe", out_bgr)
+                if should_quit_from_key(cv2.waitKey(1)):
                     break
             frame_id += 1
             continue
@@ -502,17 +580,13 @@ def main():
         t4 = time.time()
         out_img = render_frame(renderer, frame, all_verts, all_cam_t, all_right, img_size, scaled_focal, args)
         out_bgr = out_img[:, :, ::-1]
-        if is_video:
-            if ffmpeg_proc is not None:
-                ffmpeg_proc.stdin.write(out_bgr.tobytes())
-        else:
-            out_name = f"{output_stem}.jpg" if not is_webcam else f"frame_{frame_id:06d}.jpg"
-            out_path = os.path.join(args.out_folder, out_name)
-            cv2.imwrite(out_path, out_bgr)
+        if args.show_fps:
+            out_bgr = draw_fps_overlay(out_bgr, realtime_fps)
+        write_frame_output(out_bgr)
 
         if args.show:
             cv2.imshow("HaMeR + MediaPipe", out_bgr)
-            if cv2.waitKey(0 if not is_webcam else 1) & 0xFF == 27:
+            if should_quit_from_key(cv2.waitKey(0 if not is_webcam else 1)):
                 break
         t5 = time.time()
 
@@ -522,8 +596,20 @@ def main():
 
     if is_webcam or is_video:
         cap.release()
+    if webcam_auto_fps and ffmpeg_proc is None and webcam_probe_frames:
+        elapsed = max((time.time() - webcam_probe_start) if webcam_probe_start is not None else 0.0, 1e-6)
+        estimated_fps = (len(webcam_probe_frames) - 1) / elapsed if len(webcam_probe_frames) > 1 else default_fps
+        output_fps = float(min(max(estimated_fps, 1.0), 60.0))
+        print(f"[INFO] Webcam output FPS (auto-final): {output_fps:.2f}")
+        ffmpeg_proc, output_video_path = start_ffmpeg_writer(args.out_folder, output_stem, output_fps, img_w, img_h)
+        for buffered_frame in webcam_probe_frames:
+            ffmpeg_proc.stdin.write(buffered_frame.tobytes())
+        webcam_probe_frames.clear()
     if ffmpeg_proc is not None:
-        ffmpeg_proc.stdin.close()
+        try:
+            ffmpeg_proc.stdin.close()
+        except Exception:
+            pass
         ffmpeg_proc.wait()
         if ffmpeg_proc.returncode != 0:
             stderr = ffmpeg_proc.stderr.read().decode(errors="replace")
@@ -532,11 +618,13 @@ def main():
     if args.show:
         cv2.destroyAllWindows()
 
-    if is_video:
+    if is_webcam or is_video:
         if args.save_video and output_video_path is not None:
             print(f"\nProcessing complete! Video saved to {output_video_path}")
-        else:
+        elif is_video:
             print(f"\nProcessing complete! {frame_id} video frames processed (no frame files saved).")
+        else:
+            print(f"\nProcessing complete! {frame_id} webcam frames processed.")
     else:
         print(f"\nProcessing complete! {frame_id} frames saved to {args.out_folder}")
 
